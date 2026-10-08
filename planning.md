@@ -386,6 +386,7 @@ For each milestone, the AI coding assistant gets **only the spec sections it nee
    - **Pass:** all 5 AI texts have `ai_likelihood` > 0.6, all 5 human texts < 0.4, and the average gap between the groups is at least 0.3.
    - **Fail:** scores bunch together around 0.5 for everything, or a human text reaches `likely_ai`. In that case, adjust the anchors and weights in `config.py`. Don't ask the AI to "make it work."
    - Save this table. It becomes the start of the calibration check described in Q2 and the README's evidence that the scores are meaningful.
+   - NOTE: MATTR anchors too low — synthetic AI sample scored 0.886.
 
 ---
 
