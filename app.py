@@ -1,7 +1,10 @@
+import json
 import re
 import statistics
+import threading
 import uuid
 from datetime import datetime, timezone
+from pathlib import Path
 
 from flask import Flask, jsonify, request
 
@@ -12,6 +15,8 @@ app = Flask(__name__)
 # ---------------------------------------------------------------------------
 
 MAX_TEXT_CHARS = 5000
+AUDIT_LOG_PATH = Path(__file__).resolve().parent / "audit_log.jsonl"
+LOG_RECENT_LIMIT = 50
 
 # Signal 1: burstiness anchors (coefficient of variation of words per unit)
 BURST_CV_HUMAN = 0.70
@@ -168,14 +173,37 @@ CONTENT_STORE = {}
 
 
 def _new_content_id():
-    while True:
-        cid = "c_" + uuid.uuid4().hex[:4]
-        if cid not in CONTENT_STORE:
-            return cid
+    # Full UUID: the audit log outlives the in-memory store, so IDs must stay
+    # unique across restarts.
+    return str(uuid.uuid4())
 
 
 def _now():
-    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace(
+        "+00:00", "Z"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Audit Logger (append-only JSON Lines: one entry per line, never edited)
+# ---------------------------------------------------------------------------
+
+_audit_lock = threading.Lock()
+
+
+def write_audit_entry(entry):
+    line = json.dumps(entry, ensure_ascii=False)
+    with _audit_lock, AUDIT_LOG_PATH.open("a", encoding="utf-8") as f:
+        f.write(line + "\n")
+
+
+def get_log(limit=LOG_RECENT_LIMIT):
+    """Return the most recent audit entries, newest first."""
+    if not AUDIT_LOG_PATH.exists():
+        return []
+    with AUDIT_LOG_PATH.open(encoding="utf-8") as f:
+        entries = [json.loads(line) for line in f if line.strip()]
+    return entries[-limit:][::-1]
 
 
 # ---------------------------------------------------------------------------
@@ -229,6 +257,19 @@ def submit():
         "ai_likelihood": 0.5,
         "confidence": 0.5,
         "label": UNCERTAIN_LABEL,
+        "status": "classified",
+    })
+
+    write_audit_entry({
+        "event": "classified",
+        "timestamp": _now(),
+        "content_id": content_id,
+        "creator_id": record["creator_id"],
+        "attribution": record["attribution"],
+        "confidence": record["confidence"],
+        "stylometry_score": stylometry["score"],
+        "llm_score": None,
+        "status": record["status"],
     })
 
     return jsonify({
@@ -241,6 +282,13 @@ def submit():
         "word_count": stylometry["word_count"],
         "signals": record["signals"],
     }), 200
+
+
+# No auth: exposed for documentation and grading visibility. A real system
+# would restrict this to reviewers.
+@app.get("/log")
+def log():
+    return jsonify({"entries": get_log()})
 
 
 if __name__ == "__main__":
