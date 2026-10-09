@@ -1,3 +1,4 @@
 .env
 __pycache__/
 audit_log.jsonl
+.venv/
