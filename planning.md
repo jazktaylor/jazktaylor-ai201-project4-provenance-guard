@@ -313,7 +313,7 @@ For each milestone, the AI coding assistant gets **only the spec sections it nee
 
 ---
 
-### M3: Submission endpoint + first signal
+### Submission endpoint + first signal
 
 **Spec sections provided**
 - `## Architecture` (the diagram): shows where `/submit` and the Stylometry Analyzer sit in the flow
@@ -350,7 +350,7 @@ For each milestone, the AI coding assistant gets **only the spec sections it nee
 
 ---
 
-### M4: Second signal + confidence scoring
+### Second signal + confidence scoring
 
 **Spec sections provided**
 - `## Architecture` (the diagram): shows Signal 2 and the Confidence Scorer coming after Signal 1
@@ -407,7 +407,7 @@ For each milestone, the AI coding assistant gets **only the spec sections it nee
 
 ---
 
-### M5: Production layer
+### Production layer
 
 **Spec sections provided**
 - `## Architecture` (the diagram): the label step, the audit log and the full appeal flow
