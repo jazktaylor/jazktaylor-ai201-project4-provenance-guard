@@ -54,16 +54,20 @@ These answers pin down the exact behavior the code will follow. All numeric cons
    - Prose: split on `[.!?]+` followed by whitespace.
    - Poetry: if the text has ≥ 4 line breaks **and** fewer sentence-ending marks than lines, each non-empty line counts as one unit. *(This keeps unpunctuated poems from becoming one giant "sentence.")*
 2. **Burstiness:** coefficient of variation of words per unit, `cv = stdev / mean`.
-   - Human text usually has `cv` ≈ 0.6 or higher. AI text is often around 0.3.
-   - Formula: `burst_score = clip((0.70 − cv) / (0.70 − 0.25), 0, 1)`
+   - Human text usually has `cv` ≈ 0.6 or higher. AI text is often around 0.3. (Reference set: human median 0.58, AI median 0.32.)
+   - Formula: `burst_score = clip((0.60 − cv) / (0.60 − 0.25), 0, 1)`
    - Low variation gives a high (AI-like) score.
    - With fewer than 3 units, the burstiness score is set to 0.5 (neutral), because there isn't enough data.
 3. **Vocabulary diversity:** moving-average type-token ratio (MATTR) with a 50-word window. Plain type-token ratio drops as texts get longer, and MATTR doesn't.
-   - Formula: `vocab_score = clip((0.78 − mattr) / (0.78 − 0.62), 0, 1)`
+   - **Direction:** current LLMs use *more* varied vocabulary than people, so high MATTR is the AI-like side (reference set: human median 0.80, AI median 0.85). The original assumption (AI = repetitive, low MATTR) was backwards and scored `vocab = 0` on nearly every text.
+   - Formula: `vocab_score = clip((mattr − 0.78) / (0.88 − 0.78), 0, 1)`
+   - Under 150 words, `vocab_score` is set to 0.5 (neutral). MATTR averages only a few overlapping windows there and barely separates the groups (AUC 0.64 at 55 words, 0.69 at 100, 0.78 at 150, on the reference set truncated). A 55-word casual restaurant review scored MATTR 0.87, which would read as AI.
 4. **Stock phrases:** count matches from a list of about 40 phrases in `signals/stock_phrases.txt` ("delve," "tapestry," "testament to," "it's important to note," "in today's fast-paced world," "a symphony of," …). Matches inside quotation marks are skipped.
    - Formula: `phrase_score = clip(hits_per_100_words / 1.0, 0, 1)`
    - So 1 hit per 100 words already gives the maximum score.
-5. **Combine:** `stylometry = 0.4 × burst_score + 0.3 × vocab_score + 0.3 × phrase_score`
+5. **Combine:** `stylometry = 0.4 × burst_score + 0.4 × vocab_score + 0.2 × phrase_score`
+   - Burstiness and MATTR separate human from AI about equally well (AUC 0.94 and 0.90), so they share most of the weight.
+   - Stock phrases are weak on current models (AUC 0.63; most AI texts have zero hits) but never fired on a human text, so they act as a small, high-precision bonus.
 
 **Signal 2: exact computation**
 
@@ -387,6 +391,19 @@ For each milestone, the AI coding assistant gets **only the spec sections it nee
    - **Fail:** scores bunch together around 0.5 for everything, or a human text reaches `likely_ai`. In that case, adjust the anchors and weights in `config.py`. Don't ask the AI to "make it work."
    - Save this table. It becomes the start of the calibration check described in Q2 and the README's evidence that the scores are meaningful.
    - NOTE: MATTR anchors too low — synthetic AI sample scored 0.886.
+   - **Stylometry calibration (2026-10-09)**, `scripts/run_calibration.py`. Human: 20 excerpts of ~250 words (14 Paul Graham essays from 2005–2021, 6 from Project Gutenberg: Jerome, Twain, Doyle). AI: 19 texts of ~250 words generated on Groq (`gpt-oss-120b`, `gpt-oss-20b`, `qwen3.8-27b`) across 10 genres: essays, blog posts, a personal story, a memoir, fiction, a review.
+
+     | | human median | AI median | AUC |
+     |---|---|---|---|
+     | cv | 0.583 | 0.315 | 0.06 (low = AI) |
+     | MATTR | 0.798 | 0.848 | 0.90 |
+     | burst_score | 0.067 | 0.815 | 0.94 |
+     | vocab_score | 0.182 | 0.679 | 0.90 |
+     | phrase_score | 0.000 | 0.000 | 0.63 |
+     | **stylometry** | **0.120** | **0.626** | **0.96** |
+
+     Human ≤ 0.4: 20/20 (max 0.32). AI ≥ 0.6: 13/19 (min 0.15). Median gap 0.51. Stylometry alone never pushes a human text toward AI, but it misses about a third of AI texts, which is the judge's job.
+     Anchor rule: the human anchor sits near the typical human value, and the AI anchor at the most AI-like quartile of the AI texts. Caveat: this is a small set dominated by one human author, so re-run it on more varied human writing before trusting the anchors further.
 
 ---
 
