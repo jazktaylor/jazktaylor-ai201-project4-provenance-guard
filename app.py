@@ -381,15 +381,35 @@ def _now():
 # ---------------------------------------------------------------------------
 
 APPEALS = {}
-_appeal_counter = 0
+# None until the first appeal, then seeded from the audit log
+_appeal_counter = None
 # Guards the 409 check, counter and status change so two concurrent appeals
 # on one item can't both succeed
 _appeal_lock = threading.Lock()
+APPEAL_ID_RE = re.compile(r"ap_(\d+)")
+
+
+def _last_logged_appeal_number():
+    # The audit log outlives the in-memory store, so appeal IDs continue from
+    # the highest one already logged instead of restarting at ap_0001.
+    if not AUDIT_LOG_PATH.exists():
+        return 0
+    highest = 0
+    with AUDIT_LOG_PATH.open(encoding="utf-8") as f:
+        for line in f:
+            if not line.strip():
+                continue
+            m = APPEAL_ID_RE.fullmatch(str(json.loads(line).get("appeal_id", "")))
+            if m:
+                highest = max(highest, int(m.group(1)))
+    return highest
 
 
 def _new_appeal_id():
     # Caller must hold _appeal_lock
     global _appeal_counter
+    if _appeal_counter is None:
+        _appeal_counter = _last_logged_appeal_number()
     _appeal_counter += 1
     return f"ap_{_appeal_counter:04d}"
 
