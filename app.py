@@ -8,11 +8,21 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 from flask import Flask, jsonify, request
+from flask_limiter import Limiter
+from flask_limiter.util import get_remote_address
 from groq import Groq
 
 load_dotenv()
 
 app = Flask(__name__)
+
+# In-memory counters: fine for one local process, reset on restart
+limiter = Limiter(
+    get_remote_address,
+    app=app,
+    default_limits=[],
+    storage_uri="memory://",
+)
 
 # ---------------------------------------------------------------------------
 # Config (starting values; moves to config.py per the spec)
@@ -21,6 +31,15 @@ app = Flask(__name__)
 MAX_TEXT_CHARS = 5000
 AUDIT_LOG_PATH = Path(__file__).resolve().parent / "audit_log.jsonl"
 LOG_RECENT_LIMIT = 50
+
+# Rate limit on POST /submit, per client IP (reasoning in README.md).
+# A writer checking their own work rarely needs more than a few submissions
+# in a minute; every submission costs a Groq call, so a script is cut off fast.
+SUBMIT_RATE_LIMIT = "10 per minute;100 per day"
+
+# Appeals: reason length after stripping, so "it's wrong" isn't enough
+APPEAL_REASON_MIN_CHARS = 20
+APPEAL_REASON_MAX_CHARS = 2000
 
 # Signal 1 anchors were set on a 20 human / 19 AI reference set
 # (2026-10-09): the human anchor sits near the typical human value, the AI
@@ -113,12 +132,25 @@ LABELS = {
         "❔ We're not sure. Our checks found mixed signals about whether AI was "
         "used to write this text. Please use your own judgment."
     ),
-    # Shown while an appeal is pending (appeals arrive in M5)
+    # Shown while an appeal is pending; replaces whichever label was showing
     "under_review": (
         "⏳ Under review. The author has asked for this label to be checked by "
         "a person. No decision has been made yet."
     ),
 }
+
+ATTRIBUTIONS = ("likely_ai", "likely_human", "uncertain")
+
+
+def label_for(attribution, status):
+    """Label text for a content record. "under_review" overrides the
+    attribution label; an unknown attribution raises instead of guessing."""
+    if attribution not in ATTRIBUTIONS:
+        raise ValueError(f"unknown attribution: {attribution!r}")
+    if status == "under_review":
+        return LABELS["under_review"]
+    return LABELS[attribution]
+
 
 # ---------------------------------------------------------------------------
 # Signal 1: Stylometry Analyzer
@@ -345,6 +377,24 @@ def _now():
 
 
 # ---------------------------------------------------------------------------
+# Appeals (in-memory, linked from the content record by appeal_id)
+# ---------------------------------------------------------------------------
+
+APPEALS = {}
+_appeal_counter = 0
+# Guards the 409 check, counter and status change so two concurrent appeals
+# on one item can't both succeed
+_appeal_lock = threading.Lock()
+
+
+def _new_appeal_id():
+    # Caller must hold _appeal_lock
+    global _appeal_counter
+    _appeal_counter += 1
+    return f"ap_{_appeal_counter:04d}"
+
+
+# ---------------------------------------------------------------------------
 # Audit Logger (append-only JSON Lines: one entry per line, never edited)
 # ---------------------------------------------------------------------------
 
@@ -358,11 +408,17 @@ def write_audit_entry(entry):
 
 
 def get_log(limit=LOG_RECENT_LIMIT):
-    """Return the most recent audit entries, newest first."""
+    """Return the most recent audit entries, newest first. Each classified
+    entry's appeal_filed is set from the whole log, since the file itself is
+    never edited after an appeal arrives."""
     if not AUDIT_LOG_PATH.exists():
         return []
     with AUDIT_LOG_PATH.open(encoding="utf-8") as f:
         entries = [json.loads(line) for line in f if line.strip()]
+    appealed = {e["content_id"] for e in entries if e.get("event") == "appeal_filed"}
+    for e in entries:
+        if e.get("event") == "classified":
+            e["appeal_filed"] = e["content_id"] in appealed
     return entries[-limit:][::-1]
 
 
@@ -381,6 +437,7 @@ def health():
 
 
 @app.post("/submit")
+@limiter.limit(SUBMIT_RATE_LIMIT)
 def submit():
     body = request.get_json(silent=True)
     if not isinstance(body, dict):
@@ -417,7 +474,8 @@ def submit():
         stylometry["word_count"],
     )
     record.update(scored)
-    record.update({"label": LABELS[scored["attribution"]], "status": "classified"})
+    record["status"] = "classified"
+    record["label"] = label_for(record["attribution"], record["status"])
 
     write_audit_entry({
         "event": "classified",
@@ -438,6 +496,8 @@ def submit():
         "word_count": stylometry["word_count"],
         "penalties_applied": record["penalties_applied"],
         "status": record["status"],
+        # Always false when written; GET /log reports later appeals
+        "appeal_filed": False,
     })
 
     return jsonify({
@@ -451,6 +511,103 @@ def submit():
         "word_count": stylometry["word_count"],
         "signals": record["signals"],
     }), 200
+
+
+@app.post("/appeal")
+def appeal():
+    body = request.get_json(silent=True)
+    if not isinstance(body, dict):
+        return jsonify({"error": "Request body must be a JSON object."}), 400
+
+    content_id = body.get("content_id")
+    creator_id = body.get("creator_id")
+    reasoning = body.get("creator_reasoning")
+    evidence_url = body.get("evidence_url")
+    if not isinstance(content_id, str) or not content_id.strip():
+        return jsonify({"error": "'content_id' is required."}), 400
+    # Optional: when given it must match the submitter. Without accounts it
+    # is taken on trust either way, so it only guards against mix-ups.
+    if creator_id is not None and (
+        not isinstance(creator_id, str) or not creator_id.strip()
+    ):
+        return jsonify({"error": "'creator_id' must be a non-empty string."}), 400
+    if not isinstance(reasoning, str):
+        return jsonify({"error": "'creator_reasoning' is required."}), 400
+    reasoning = reasoning.strip()
+    if not APPEAL_REASON_MIN_CHARS <= len(reasoning) <= APPEAL_REASON_MAX_CHARS:
+        return jsonify({
+            "error": f"'creator_reasoning' must be {APPEAL_REASON_MIN_CHARS}-"
+                     f"{APPEAL_REASON_MAX_CHARS} characters."
+        }), 400
+    # Optional; stored as-is and never fetched
+    if evidence_url is not None and not isinstance(evidence_url, str):
+        return jsonify({"error": "'evidence_url' must be a string."}), 400
+
+    with _appeal_lock:
+        record = CONTENT_STORE.get(content_id.strip())
+        if record is None:
+            return jsonify({"error": "Content not found."}), 404
+        if creator_id is not None and creator_id.strip() != record["creator_id"]:
+            return jsonify({"error": "Only the original submitter can appeal."}), 403
+        if record["status"] == "under_review":
+            return jsonify({"error": "This content already has an open appeal."}), 409
+        if record["status"] != "classified":
+            # Still pending: there is no decision to appeal yet
+            return jsonify({"error": "This content has not been classified yet."}), 409
+
+        appeal_id = _new_appeal_id()
+        APPEALS[appeal_id] = {
+            "appeal_id": appeal_id,
+            "content_id": record["content_id"],
+            "creator_id": record["creator_id"],
+            "appeal_reasoning": reasoning,
+            "evidence_url": evidence_url,
+            "filed_at": _now(),
+            "appeal_status": "open",
+        }
+        status_before = record["status"]
+        record["appeal_id"] = appeal_id
+        record["status"] = "under_review"
+        record["label"] = label_for(record["attribution"], record["status"])
+
+    # Detectors are not re-run: the original decision is logged as-is
+    llm_judge = record["signals"]["llm_judge"]
+    write_audit_entry({
+        "event": "appeal_filed",
+        "timestamp": _now(),
+        "content_id": record["content_id"],
+        "appeal_id": appeal_id,
+        "creator_id": record["creator_id"],
+        "status": record["status"],
+        "appeal_reasoning": reasoning,
+        "original_decision": {
+            "attribution": record["attribution"],
+            "ai_likelihood": record["ai_likelihood"],
+            "confidence": record["confidence"],
+            # Signal scores only; llm_judge is null when Groq failed
+            "signals": {
+                "stylometry": record["signals"]["stylometry"]["score"],
+                "llm_judge": llm_judge["score"] if llm_judge else None,
+            },
+        },
+        "status_before": status_before,
+        "status_after": record["status"],
+        "appeal_filed": True,
+    })
+
+    return jsonify({
+        "message": "Appeal received. A person will review this label.",
+        "appeal_id": appeal_id,
+        "content_id": record["content_id"],
+        "status": record["status"],
+        "label": record["label"],
+    }), 201
+
+
+@app.errorhandler(429)
+def rate_limited(e):
+    # Same {"error": ...} shape as the other endpoints
+    return jsonify({"error": f"Too many submissions: limit is {e.description}."}), 429
 
 
 # No auth: exposed for documentation and grading visibility. A real system
